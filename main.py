@@ -1,297 +1,396 @@
-# Импорт библиотек
+import asyncio
 import random
-import time
-import telebot
-from telebot import types
-from db import reg_db
-from db import get_info
-from db import init_db
-from db import plus_ans
-from db import delete_dup
-from db import check_user
+from pathlib import Path
 
-# Подключение к тг
-bot = telebot.TeleBot('token')
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
-# Файл с id пользователей
-joinedFile = open('id.txt', 'r')
-joinedUsers = set()
-for line in joinedFile:
-    joinedUsers.add(line.strip())
-joinedFile.close()
+from db import check_user, delete_dup, get_info, init_db, plus_ans, reg_db
 
-# Файл с проголосовавшими пользователями
-joinedFile1 = open('voted_users.txt', 'r')
-joinedUsers1 = set()
-for line in joinedFile1:
-    joinedUsers1.add(line.strip())
-joinedFile1.close()
-# Рандомное число для рандомного слова
-randNum = random.randint(1, 2600)
-# Открытие файлов со словами
-file = open('words.txt').readlines()
-file1 = open('words_upper.txt').readlines()
-arr_upper = [str(i) for i in file1]
-arr = [str(i) for i in file]
+# ---------------------------------------------------------------------------
+# Настройки
+# ---------------------------------------------------------------------------
+TOKEN = "token"
+WORDS_FILE = Path("words.txt")
+WORDS_UPPER_FILE = Path("words_upper.txt")
+USERS_FILE = Path("id.txt")
+VOTED_FILE = Path("voted_users.txt")
+MAX_WORD_INDEX = 2600
 
-# Переменные для фикса багов
-count_play = 0
-count_own = 0
-own = None
-word = None
-guess_pem = None
-total = 0
-# Отображение статистики
-@bot.message_handler(commands=['stat'])
-def get_stat(message):
-    count = 1
-    try:
-        for user in joinedUsers:
-            user_info = (get_info(user_id=user))
-            bot.send_message(message.chat.id,
-                             f'[{user_info[2]}](tg://user?id={user}) - ' + f'{user_info[1]} ответов',
-                             parse_mode='markdown')
-            count += 1
-    except Exception as e:
-        print(e)
-# Начало голосования для остановки игры
-@bot.message_handler(commands=['stop'])
-def stop_game(message):
-    global total
-    markup = types.InlineKeyboardMarkup()
-    btn = types.InlineKeyboardButton('Проголосовать', callback_data='vote')
-    markup.add(btn)
-    bot.send_message(message.chat.id, 'Голосование за смену ведущего', reply_markup=markup)
-    with open('voted_users.txt', 'w') as f:
-        f.write('')
-    return total
-# Загадывание собственного слова
-@bot.message_handler(commands=['own'])
-def own_word(message):
-    global guess_pem, count_own, word, current_player
-    print(word, guess_pem, count_own)
-    if guess is True or count_own != 0:
-        bot.send_message(message.chat.id, 'Невозможно начать другую игру')
-    else:
-        current_player = message.from_user.id
-        bot.send_message(chat_id,
-                         f'[{message.from_user.first_name}](tg://user?id={message.from_user.id}) - вводит слово боту',
-                         parse_mode='markdown')
-        word = True
-        own_wordd = bot.send_message(message.from_user.id, text='Введи слово, которое хочешь загадать')
-        bot.register_next_step_handler(own_wordd, check_word)
-        count_own += 1
-        return word, count_own, current_player
-
-# Начало работы 
-@bot.message_handler(commands=['start'])
-def start(message):
-    global count_play, count_own,  count ,chat_id, word
-    count_play = 0
-    count_own = 0
-    count = 0
-    word = False
-    chat_id = message.chat.id
-
-    if not str(message.from_user.id) in joinedUsers:
-        joinedFile = open('id.txt', "a")
-        joinedFile.write(str(message.from_user.id) + '\n')
-        joinedUsers.add(message.from_user.id)
-        reg_db(user_id=message.from_user.id, answers=0, first_name=message.from_user.first_name)
-    init_db()
-    bot.send_message(message.chat.id,
-                     '/play - начать обычную игру\n/own - загадать свое слово(слово нужно писать в лс боту)\n/stat - просмотреть статистику')
-
-    print(message.chat.id)
-    return count_play, count_own, count, chat_id, word
-
-# Начало обычной игры
-@bot.message_handler(commands=['play'])
-
-def guess(message):
-    global randNum, count_play, guess_pem, word, current_player
-    print(word, count_play)
-    if count_play == 0 and word is False:
-        guess = True
-        current_player = message.from_user.id
-        btn = types.InlineKeyboardButton(text='Посмотреть слово', callback_data='slovo')
-        btn1 = types.InlineKeyboardButton(text='Следующее слово', callback_data='sled', )
-        markup = types.InlineKeyboardMarkup()
-        markup.add(btn)
-        markup.add(btn1)
-        word = bot.send_message(message.chat.id,
-                                f'[{message.from_user.first_name}](tg://user?id={message.from_user.id}) загадывает слово'
-                                , parse_mode='markdown', reply_markup=markup)
-        bot.register_next_step_handler(word, check)
+# ---------------------------------------------------------------------------
+# FSM — состояния для ввода слова
+# ---------------------------------------------------------------------------
+class WordInput(StatesGroup):
+    waiting_for_word = State()
 
 
-        count_play += 1
-        return randNum, guess, current_player
+# ---------------------------------------------------------------------------
+# Состояние игры (один чат — одна игра, хранится в памяти)
+# ---------------------------------------------------------------------------
+class GameState:
+    def __init__(self):
+        self.chat_id: int | None = None
+        self.joined_users: set[str] = self._load_set(USERS_FILE)
+        self.voted_users: set[str] = self._load_set(VOTED_FILE)
+        self.words: list[str] = WORDS_FILE.read_text(encoding="utf-8").splitlines(keepends=True)
+        self.words_upper: list[str] = WORDS_UPPER_FILE.read_text(encoding="utf-8").splitlines(keepends=True)
+        self.reset()
 
-    else:
-        bot.send_message(message.chat.id, 'Невозможно начать игру')
-        
-# Проверка слова на правильность
-@bot.message_handler(content_types=['text'])
-def check(message):
-    global current_player, own, guess_pem, word, count_play, count, count_own, total
-    markup = types.InlineKeyboardMarkup()
-    btn = types.InlineKeyboardButton('Начать обычную игру', callback_data='host')
-    btn1 = types.InlineKeyboardButton('Загадать свое слово', callback_data='own_new')
-    markup.add(btn)
-    markup.add(btn1)
-    print(current_player)
-    msg = message.text
-    print(own)
-    while msg != arr[randNum] or msg != arr[randNum + 1] or msg != own or msg != arr_upper[randNum] or msg != arr_upper[
-        randNum + 1] and message.from_user.id != current_player:
-        print(repr(msg + '\n'), repr(arr[randNum]), repr(arr_upper[randNum]))
+    # --- persistence helpers ---
+    @staticmethod
+    def _load_set(path: Path) -> set[str]:
+        if not path.exists():
+            return set()
+        return {line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()}
 
-        if (msg + '\n' == arr[randNum] or msg + '\n' == arr[randNum + 1] or msg + '\n' == arr_upper[
-            randNum] or msg + '\n'
-            == arr_upper[randNum + 1] or msg == own) and message.from_user.id != current_player:
-            bot.send_message(message.chat.id,
-                             text=f'[{message.from_user.first_name}](tg://user?id={message.from_user.id}) - отгадал слово *{message.text.lower()}*',
-                             parse_mode='markdown', reply_markup=markup)
-            isnot = str(check_user(user_id=message.from_user.id))
-            print(isnot)
-            guess_pem = False
-            word = False
-            count = 0
-            own = ''
-            arr[randNum] = ''
-            arr_upper[randNum] = ''
-            count_play = 0
-            count_own = 0
-            total = 0
-            print(own)
-            if isnot == '(0,)':
-                reg_db(user_id=message.from_user.id, answers=1, first_name=message.from_user.first_name)
-                break
-            else:
-                plus_ans(answers=1, user_id=message.from_user.id)
-                current_player = message.from_user.id
-                break
-        else:
-            return
+    # --- game lifecycle ---
+    def reset(self):
+        self.count_play: int = 0
+        self.count_own: int = 0
+        self.own_word: str | None = None
+        self.word_active: bool = False
+        self.current_player: int | None = None
+        self.rand_num: int = random.randint(1, MAX_WORD_INDEX - 1)
+        self.total_votes: int = 0
+        self.count: int = 0
 
+    def new_word(self):
+        self.rand_num = random.randint(1, MAX_WORD_INDEX - 1)
+
+    def invalidate_word(self):
+        """Стирает текущее слово из массивов после угадывания."""
+        self.words[self.rand_num] = ""
+        self.words_upper[self.rand_num] = ""
+
+    # --- logic ---
+    def get_current_word(self) -> str:
+        return self.words_upper[self.rand_num].strip()
+
+    def is_correct_guess(self, text: str) -> bool:
+        n = self.rand_num
+        candidates: set[str] = {
+            self.words[n].strip(),
+            self.words_upper[n].strip(),
+        }
+        if self.own_word:
+            candidates.add(self.own_word.strip())
+        return text.strip() in candidates
+
+    @property
+    def is_running(self) -> bool:
+        return self.word_active or self.count_play > 0 or self.count_own > 0
+
+
+state = GameState()
+
+# ---------------------------------------------------------------------------
+# Bot & Dispatcher
+# ---------------------------------------------------------------------------
+bot = Bot(token=TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+
+
+# ---------------------------------------------------------------------------
+# Утилиты
+# ---------------------------------------------------------------------------
+def mention(user_id: int, first_name: str) -> str:
+    return f"[{first_name}](tg://user?id={user_id})"
+
+
+def game_end_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Начать обычную игру", callback_data="host")],
+        [InlineKeyboardButton(text="Загадать своё слово", callback_data="own_new")],
+    ])
+
+
+def host_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Посмотреть слово", callback_data="slovo")],
+        [InlineKeyboardButton(text="Следующее слово", callback_data="sled")],
+    ])
+
+
+def own_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Просмотреть слово", callback_data="own")],
+    ])
+
+
+def vote_markup(total: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"Проголосовать ({total})", callback_data="vote")],
+    ])
+
+
+def register_user(user) -> None:
+    uid = str(user.id)
+    if uid not in state.joined_users:
+        with USERS_FILE.open("a", encoding="utf-8") as f:
+            f.write(uid + "\n")
+        state.joined_users.add(uid)
+        reg_db(user_id=user.id, answers=0, first_name=user.first_name)
+
+
+def finalize_round() -> None:
+    state.invalidate_word()
+    state.reset()
     delete_dup()
 
 
-def check_word(message):
-    global own, chat_id
-    own = message.text
-    if own != '':
-        bot.send_message(message.from_user.id, 'Слово принято')
-        btn = types.InlineKeyboardButton(text='Просмотреть слово', callback_data='own')
-        markup = types.InlineKeyboardMarkup()
-        markup.add(btn)
-        word = bot.send_message(chat_id,
-                                f'[{message.from_user.first_name}](tg://user?id={message.from_user.id}) загадывает слово'
-                                , parse_mode='markdown', reply_markup=markup)
-        bot.register_next_step_handler(word, check)
-    return own
-
-# Ответы на нажатие Inline кнопок
-@bot.callback_query_handler(func=lambda call: True)
-def callback_worker(call: types.CallbackQuery):
-    global current_player, randNum, i, own, count_play, word, count, count_own
-    if call.data == 'slovo' and call.from_user.id == current_player:
-        arr[randNum] = arr[randNum + 1]
-        bot.answer_callback_query(call.id, show_alert=True, text=f"Слово {arr[randNum]}")
-
-    elif call.data == 'sled' and call.from_user.id == current_player:
-        randNum = random.randint(1, 2621)
-        bot.answer_callback_query(call.id, show_alert=True, text=f"Слово {arr[randNum + 1]}")
-        bot.send_message(call.message.chat.id,
-                         f'[{call.from_user.first_name}](tg://user?id={call.from_user.id}) решил заменить слово',
-                         parse_mode='markdown')
-
-        return randNum
-    elif call.data == 'vote':
-        global total, guess_pem
-        if not str(call.from_user.id) in joinedUsers1:
-            with open('voted_users.txt', 'w') as file:
-                file.write(str(call.from_user.id) + '\n')
-
-            bot.answer_callback_query(call.id, show_alert=True, text=f'Ваш голос засчитан')
-
-            total += 1
-        else:
-            bot.answer_callback_query(call.id, show_alert=True, text=f'Вы уже проголосовали')
-        markup = types.InlineKeyboardMarkup()
-        btn = types.InlineKeyboardButton('Проголосовать', callback_data='vote')
-        markup.add(btn)
+# ---------------------------------------------------------------------------
+# /start
+# ---------------------------------------------------------------------------
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    state.chat_id = message.chat.id
+    state.reset()
+    register_user(message.from_user)
+    init_db()
+    await message.answer(
+        "/play — начать обычную игру\n"
+        "/own — загадать своё слово (пишешь боту в ЛС)\n"
+        "/stat — статистика\n"
+        "/stop — голосование за смену ведущего"
+    )
 
 
-        bot.edit_message_text(chat_id=call.message.chat.id,message_id=call.message.id, text=f'Голосование за смену ведущего. Всего голосов {total}',reply_markup=markup)
-        if total == bot.get_chat_member_count(call.message.chat.id) /2  or total > bot.get_chat_member_count(call.message.chat.id) / 2:
-            bot.send_message(call.message.chat.id, f'Игра остановлена' , parse_mode='markdown')
-            guess_pem = False
-            word = False
-            count = 0
-            own = ''
-            arr[randNum] = ''
-            arr_upper[randNum] = ''
-            count_play = 0
-            count = 0
-            count_own = 0
-            total = 0
-            print(current_player)
+# ---------------------------------------------------------------------------
+# /stat
+# ---------------------------------------------------------------------------
+@dp.message(Command("stat"))
+async def cmd_stat(message: Message):
+    if not state.joined_users:
+        await message.answer("Пока нет игроков.")
+        return
+    for uid in state.joined_users:
+        try:
+            info = get_info(user_id=uid)
+            await message.answer(
+                f"[{info[2]}](tg://user?id={uid}) — {info[1]} ответов",
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            print(f"Stat error for {uid}: {e}")
 
-        print(bot.get_chat_member_count(call.message.chat.id))
-    elif call.data == 'own_new':
-        if count == 0:
-            bot.answer_callback_query(call.id, show_alert=True, text='Введи свое слово самому боту')
-            own_wordd = bot.send_message(call.from_user.id, text='Введи слово, которое хочешь загадать')
-            bot.register_next_step_handler(own_wordd, check_word)
-            count += 1
-        else:
-            bot.send_message(call.message.chat.id, 'Игра уже идет')
 
-            return randNum, count
-    elif call.data == 'own' and own != '' and call.from_user.id == current_player:
-        bot.answer_callback_query(call.id, show_alert=True, text=f'Слово {own}')
+# ---------------------------------------------------------------------------
+# /stop  — голосование за смену ведущего
+# ---------------------------------------------------------------------------
+@dp.message(Command("stop"))
+async def cmd_stop(message: Message):
+    state.voted_users.clear()
+    VOTED_FILE.write_text("", encoding="utf-8")
+    state.total_votes = 0
+    await message.answer(
+        "Голосование за смену ведущего",
+        reply_markup=vote_markup(0),
+    )
 
-    elif call.data == 'host':
-        if count == 0:
-            randNum = random.randint(1, 2621)
-            current_player = call.from_user.id
-            bot.answer_callback_query(call.id, show_alert=True, text=f'Теперь ты хост')
 
-            btn = types.InlineKeyboardButton(text='Просмотреть слово', callback_data='slovo')
-            btn1 = types.InlineKeyboardButton(text='Следующее слово', callback_data='sled')
-            markup = types.InlineKeyboardMarkup()
-            markup.add(btn)
-            markup.add(btn1)
-            bot.send_message(call.message.chat.id,
-                             f'[{call.from_user.first_name}](tg://user?id={call.from_user.id}) загадывает слово'
-                             , parse_mode='markdown', reply_markup=markup)
-            bot.register_next_step_handler(call.message, check)
-            count += 1
-        else:
-            bot.send_message(call.message.chat.id, 'Игра уже идет')
+# ---------------------------------------------------------------------------
+# /play
+# ---------------------------------------------------------------------------
+@dp.message(Command("play"))
+async def cmd_play(message: Message):
+    if state.is_running:
+        await message.answer("Невозможно начать игру — уже идёт.")
+        return
 
-            return randNum, count
+    state.current_player = message.from_user.id
+    state.word_active = True
+    state.count_play += 1
 
+    await message.answer(
+        f"{mention(message.from_user.id, message.from_user.first_name)} загадывает слово",
+        parse_mode="Markdown",
+        reply_markup=host_markup(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# /own
+# ---------------------------------------------------------------------------
+@dp.message(Command("own"))
+async def cmd_own(message: Message, fsm_state: FSMContext):
+    if state.is_running:
+        await message.answer("Невозможно начать другую игру.")
+        return
+
+    state.current_player = message.from_user.id
+    state.count_own += 1
+
+    if state.chat_id:
+        await bot.send_message(
+            state.chat_id,
+            f"{mention(message.from_user.id, message.from_user.first_name)} вводит слово боту",
+            parse_mode="Markdown",
+        )
+
+    # Просим слово в ЛС
+    await message.answer("Введи слово, которое хочешь загадать:")
+    await fsm_state.set_state(WordInput.waiting_for_word)
+
+
+# ---------------------------------------------------------------------------
+# FSM — получение кастомного слова
+# ---------------------------------------------------------------------------
+@dp.message(WordInput.waiting_for_word)
+async def receive_own_word(message: Message, fsm_state: FSMContext):
+    word = message.text.strip() if message.text else ""
+    if not word:
+        await message.answer("Слово не может быть пустым. Попробуй ещё:")
+        return
+
+    state.own_word = word
+    state.word_active = True
+    await fsm_state.clear()
+
+    await message.answer("Слово принято!")
+
+    if state.chat_id:
+        await bot.send_message(
+            state.chat_id,
+            f"{mention(message.from_user.id, message.from_user.first_name)} загадывает слово",
+            parse_mode="Markdown",
+            reply_markup=own_markup(),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Проверка угаданного слова (все текстовые сообщения в чате)
+# ---------------------------------------------------------------------------
+@dp.message(F.text, F.chat.type.in_({"group", "supergroup"}))
+async def check_guess(message: Message):
+    # Игра не активна или пишет сам ведущий — пропускаем
+    if not state.word_active:
+        return
+    if message.from_user.id == state.current_player:
+        return
+    if not state.is_correct_guess(message.text):
+        return
+
+    # Правильный ответ!
+    uid = message.from_user.id
+    await message.answer(
+        f"{mention(uid, message.from_user.first_name)} отгадал слово *{message.text.lower()}*",
+        parse_mode="Markdown",
+        reply_markup=game_end_markup(),
+    )
+
+    if check_user(user_id=uid) == (0,):
+        reg_db(user_id=uid, answers=1, first_name=message.from_user.first_name)
     else:
-        bot.answer_callback_query(call.id, show_alert=True, text='Тебе недоступно это слово')
+        plus_ans(answers=1, user_id=uid)
+
+    finalize_round()
 
 
-print('Бот запущен')
+# ---------------------------------------------------------------------------
+# Callback-кнопки
+# ---------------------------------------------------------------------------
+@dp.callback_query(F.data == "slovo")
+async def cb_slovo(call: CallbackQuery):
+    if call.from_user.id != state.current_player:
+        await call.answer("Тебе недоступно это слово.", show_alert=True)
+        return
+    await call.answer(f"Слово: {state.get_current_word()}", show_alert=True)
 
 
-# Зацикливание бота
-while True:
-    try:
-        bot.polling(none_stop=True)
+@dp.callback_query(F.data == "sled")
+async def cb_sled(call: CallbackQuery):
+    if call.from_user.id != state.current_player:
+        await call.answer("Тебе недоступно это слово.", show_alert=True)
+        return
+    state.new_word()
+    await call.answer(f"Новое слово: {state.get_current_word()}", show_alert=True)
+    await call.message.answer(
+        f"{mention(call.from_user.id, call.from_user.first_name)} решил заменить слово",
+        parse_mode="Markdown",
+    )
 
-    except Exception as e:
-        print(e)
-        time.sleep(15)
+
+@dp.callback_query(F.data == "own")
+async def cb_own_view(call: CallbackQuery):
+    if call.from_user.id != state.current_player or not state.own_word:
+        await call.answer("Тебе недоступно это слово.", show_alert=True)
+        return
+    await call.answer(f"Слово: {state.own_word}", show_alert=True)
 
 
+@dp.callback_query(F.data == "vote")
+async def cb_vote(call: CallbackQuery):
+    uid_str = str(call.from_user.id)
+    if uid_str in state.voted_users:
+        await call.answer("Вы уже проголосовали.", show_alert=True)
+        return
+
+    state.voted_users.add(uid_str)
+    with VOTED_FILE.open("a", encoding="utf-8") as f:
+        f.write(uid_str + "\n")
+    state.total_votes += 1
+    await call.answer("Ваш голос засчитан!", show_alert=True)
+
+    await call.message.edit_text(
+        f"Голосование за смену ведущего. Всего голосов: {state.total_votes}",
+        reply_markup=vote_markup(state.total_votes),
+    )
+
+    member_count = await bot.get_chat_member_count(call.message.chat.id)
+    if state.total_votes >= member_count / 2:
+        await call.message.answer("Игра остановлена.")
+        finalize_round()
 
 
+@dp.callback_query(F.data == "host")
+async def cb_host(call: CallbackQuery):
+    if state.count != 0:
+        await call.message.answer("Игра уже идёт.")
+        return
+
+    state.count += 1
+    state.current_player = call.from_user.id
+    state.word_active = True
+    state.new_word()
+
+    await call.answer("Теперь ты хост!", show_alert=True)
+    await call.message.answer(
+        f"{mention(call.from_user.id, call.from_user.first_name)} загадывает слово",
+        parse_mode="Markdown",
+        reply_markup=host_markup(),
+    )
 
 
+@dp.callback_query(F.data == "own_new")
+async def cb_own_new(call: CallbackQuery, fsm_state: FSMContext):
+    if state.count != 0:
+        await call.message.answer("Игра уже идёт.")
+        return
+
+    state.count += 1
+    state.current_player = call.from_user.id
+
+    await call.answer("Введи своё слово самому боту.", show_alert=True)
+    await bot.send_message(call.from_user.id, "Введи слово, которое хочешь загадать:")
+    await fsm_state.set_state(WordInput.waiting_for_word)
+
+
+# ---------------------------------------------------------------------------
+# Запуск
+# ---------------------------------------------------------------------------
+async def main():
+    print("Бот запущен")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
