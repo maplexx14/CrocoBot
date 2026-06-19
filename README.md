@@ -6,6 +6,6 @@ pip install telebot
 pip install sqlite3
 ```
 ## TODO
-<ul><li>Переписать бота на aiogram</li>
+<ul><li><s>Переписать бота на aiogram</s>s></li>
 <li>Переписать базу данных на postgresql</li>
 </ul>
