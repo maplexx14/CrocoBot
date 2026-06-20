@@ -2,7 +2,7 @@
 
 ## Установка зависимостей
 ```
-pip install telebot
+pip install aiogram
 pip install sqlite3
 ```
 ## TODO
