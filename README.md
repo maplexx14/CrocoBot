@@ -7,5 +7,5 @@ pip install sqlite3
 ```
 ## TODO
 <ul><li><s>Переписать бота на aiogram</s></li>
-<li><s>Переписать базу данных на postgresql</s></li>
+<li><s>Переписать базу данных на postgresql</s>(не имеет смысла)</li>
 </ul>
